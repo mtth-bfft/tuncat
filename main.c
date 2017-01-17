@@ -6,6 +6,7 @@
 #include <signal.h>
 #include <errno.h>
 #include <getopt.h>
+#include <fcntl.h>
 #include <sys/select.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
@@ -15,14 +16,16 @@
 #define STR(x) #x
 #define UNUSED(x) (void)(x)
 
+#ifndef DEFAULT_BUFFER_LEN
 #define DEFAULT_BUFFER_LEN 65536
+#endif
 
 static volatile int interrupt_flag = 0;
 static int verbosity = 0;
 
 void print_usage(FILE *f)
 {
-	fprintf(f, "Usage: tuncat [-i tunX] [-p]\n");
+	fprintf(f, "Usage: tuncat [-i tunX] [-b bufferlen] [-v] [-e] [-f] [-p]\n");
 	fprintf(f, "\n");
 	fprintf(f, "  -v, --verbose         increase verbosity (can be repeated)\n");
 	fprintf(f, "  -i, --interface=tunX  use a (possibly existing) tun interface\n");
@@ -86,6 +89,82 @@ int infinite_loop(int tun_fd, size_t buffer_len)
 	return res;
 }
 
+int create_tun(int *tun_fd, char *name, size_t name_buffer_len, int persistent)
+{
+	if (tun_fd == NULL)
+		return EINVAL;
+
+	int fd = open("/dev/net/tun", O_RDWR);
+	if (fd < 0) {
+		fprintf(stderr, "Error: could not open tun/tap module interface\n");
+		perror("open('/dev/net/tun')");
+		return errno;
+	}
+
+	struct ifreq ifr;
+	memset(&ifr, 0, sizeof(ifr));
+	ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+	if (name != NULL) {
+		if (strlen(name) >= IFNAMSIZ) {
+			fprintf(stderr, "Error: interface name too long\n");
+			close(fd);
+			return ENAMETOOLONG;
+		}
+		strncpy(ifr.ifr_name, name, IFNAMSIZ);
+	}
+
+	int res = ioctl(fd, TUNSETIFF, (void*)&ifr);
+	if (res < 0) {
+		fprintf(stderr, "Error: cannot communicate with tun/tap module\n");
+		close(fd);
+		return errno;
+	}
+
+	int saved_flags = fcntl(fd, F_GETFL);
+	if (saved_flags < 0) {
+		fprintf(stderr, "Error: unable to get flags from tun fd\n");
+		close(fd);
+		return errno;
+	}
+	res = fcntl(fd, F_SETFL, saved_flags | O_NONBLOCK);
+	if (res < 0) {
+		fprintf(stderr, "Error: unable to make tun fd non-blocking\n");
+		close(fd);
+		return errno;
+	}
+
+	if (persistent) {
+		res = ioctl(fd, TUNSETPERSIST, (persistent ? 1 : 0));
+		if (res < 0) {
+			fprintf(stderr, "Error: unable to make tun persistent\n");
+			close(fd);
+			return errno;
+		}
+	}
+
+	size_t actual_len = strlen(ifr.ifr_name);
+	if (name != NULL) {
+		if (actual_len >= name_buffer_len) {
+			fprintf(stderr, "Error: interface name too long for buffer\n");
+			close(fd);
+			return 2;
+		}
+		strncpy(name, ifr.ifr_name, name_buffer_len);
+	}
+
+	*tun_fd = fd;
+	return 0;
+}
+
+int close_tun(int fd)
+{
+	if (fd <= 0)
+		return EINVAL;
+	if (close(fd) != 0)
+		return errno;
+	return 0;
+}
+
 int main(int argc, char *argv[])
 {
 	int res = 0;
@@ -145,5 +224,14 @@ int main(int argc, char *argv[])
 		}
 	} while(res == 0 && chr != -1);
 
+	int tun_fd = 0;
+	res = create_tun(&tun_fd, ifr.ifr_name, IFNAMSIZ, persistent);
+	if (res != 0)
+		goto cleanup;
+	fprintf(stderr, "Listening on %s\n", ifr.ifr_name);
+
+cleanup:
+	if (tun_fd != 0)
+		close_tun(tun_fd);
 	return res;
 }
