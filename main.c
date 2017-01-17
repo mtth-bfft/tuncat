@@ -7,6 +7,8 @@
 #include <errno.h>
 #include <getopt.h>
 #include <fcntl.h>
+#include <pwd.h>
+#include <grp.h>
 #include <sys/select.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
@@ -32,6 +34,8 @@ void print_usage(FILE *f)
 	fprintf(f, "  -e, --ethernet        add ethernet headers (tap instead of tun)\n");
 	fprintf(f, "  -f, --flags           add flags+protocol preamble (2x2bytes)\n");
 	fprintf(f, "  -p, --permanent       keep the device after program exit\n");
+	fprintf(f, "  -u, --user=[id|name]  set the device owner (default is euid)\n");
+	fprintf(f, "  -g, --group=[id|name] set the device group (default is egid)\n");
 	fprintf(f, "  -b, --buffer=bytes    override default " STR(DEFAULT_BUFFER_LEN) "B buffer size\n");
 }
 
@@ -54,6 +58,54 @@ int setup_signal_handlers()
 
 	res = sigaction(SIGTERM, &act, NULL);
 	return res;
+}
+
+int get_uid_by_name(const char *name, uid_t *id)
+{
+	if (name == NULL || id == NULL)
+		return EINVAL;
+	char *endptr = NULL;
+	errno = 0;
+	long conv = strtol(name, &endptr, 10);
+	if (endptr != NULL && *endptr == '\0' && errno == 0) {
+		if (conv < 0 || conv > ((unsigned int)-1)) {
+			fprintf(stderr, "Error: invalid user id\n");
+			return ERANGE;
+		}
+		*id = conv;
+		return 0;
+	}
+	struct passwd *pw = getpwnam(name);
+	if (pw == NULL) {
+		fprintf(stderr, "Error: user not found\n");
+		return EINVAL;
+	}
+	*id = pw->pw_uid;
+	return 0;
+}
+
+int get_gid_by_name(const char *name, gid_t *id)
+{
+	if (name == NULL || id == NULL)
+		return EINVAL;
+	char *endptr = NULL;
+	errno = 0;
+	long conv = strtol(name, &endptr, 10);
+	if (endptr != NULL && *endptr == '\0' && errno == 0) {
+		if (conv < 0 || conv > ((unsigned int)-1)) {
+			fprintf(stderr, "Error: invalid group id\n");
+			return ERANGE;
+		}
+		*id = conv;
+		return 0;
+	}
+	struct group *gr = getgrnam(name);
+	if (gr == NULL) {
+		fprintf(stderr, "Error: group not found\n");
+		return EINVAL;
+	}
+	*id = gr->gr_gid;
+	return 0;
 }
 
 int infinite_loop(int tun_fd, size_t buffer_len)
@@ -89,7 +141,8 @@ int infinite_loop(int tun_fd, size_t buffer_len)
 	return res;
 }
 
-int create_tun(int *tun_fd, char *name, size_t name_buffer_len, int persistent)
+int create_tun(int *tun_fd, char *name, size_t name_buffer_len, int persistent,
+	uid_t uid, gid_t gid)
 {
 	if (tun_fd == NULL)
 		return EINVAL;
@@ -116,6 +169,7 @@ int create_tun(int *tun_fd, char *name, size_t name_buffer_len, int persistent)
 	int res = ioctl(fd, TUNSETIFF, (void*)&ifr);
 	if (res < 0) {
 		fprintf(stderr, "Error: cannot communicate with tun/tap module\n");
+		perror("ioctl(TUNSETIFF)");
 		close(fd);
 		return errno;
 	}
@@ -137,6 +191,28 @@ int create_tun(int *tun_fd, char *name, size_t name_buffer_len, int persistent)
 		res = ioctl(fd, TUNSETPERSIST, (persistent ? 1 : 0));
 		if (res < 0) {
 			fprintf(stderr, "Error: unable to make tun persistent\n");
+			close(fd);
+			return errno;
+		}
+	}
+
+	if (uid != (uid_t)(-1)) {
+		res = ioctl(fd, TUNSETOWNER, uid);
+		if (res < 0) {
+			fprintf(stderr, "Error: unable to set owner to %ld\n",
+				(long)uid);
+			perror("ioctl(TUNSETOWNER)");
+			close(fd);
+			return errno;
+		}
+	}
+
+	if (gid != (gid_t)(-1)) {
+		res = ioctl(fd, TUNSETGROUP, gid);
+		if (res < 0) {
+			fprintf(stderr, "Error: unable to set group to %ld\n",
+				(long)gid);
+			perror("ioctl(TUNSETGROUP)");
 			close(fd);
 			return errno;
 		}
@@ -174,12 +250,17 @@ int main(int argc, char *argv[])
 		{"ethernet", no_argument, 0, 'e'},
 		{"flags", no_argument, 0, 'f'},
 		{"permanent", no_argument, 0, 'p'},
+		{"user", required_argument, 0, 'u'},
+		{"group", required_argument, 0, 'g'},
 		{"buffer", required_argument, 0, 'b'},
 		{NULL, 0, 0, 0}
 	};
 
 	int persistent = 0;
 	int buffer_len = DEFAULT_BUFFER_LEN;
+	uid_t uid = geteuid();
+	gid_t gid = getegid();
+
 	struct ifreq ifr;
 	memset(&ifr, 0, sizeof(ifr));
 	ifr.ifr_flags = IFF_NO_PI;
@@ -211,6 +292,12 @@ int main(int argc, char *argv[])
 		case 'p':
 			persistent = 1;
 			break;
+		case 'u':
+			res = get_uid_by_name(optarg, &uid);
+			break;
+		case 'g':
+			res = get_gid_by_name(optarg, &gid);
+			break;
 		case 'b':
 			buffer_len = strtol(optarg, NULL, 10);
 			if (buffer_len <= 0) {
@@ -220,12 +307,15 @@ int main(int argc, char *argv[])
 			}
 		default:
 			print_usage(stderr);
-			break;
+			res = 1;
 		}
 	} while(res == 0 && chr != -1);
 
+	if (res != 0)
+		goto cleanup;
+
 	int tun_fd = 0;
-	res = create_tun(&tun_fd, ifr.ifr_name, IFNAMSIZ, persistent);
+	res = create_tun(&tun_fd, ifr.ifr_name, IFNAMSIZ, persistent, uid, gid);
 	if (res != 0)
 		goto cleanup;
 	fprintf(stderr, "Listening on %s\n", ifr.ifr_name);
